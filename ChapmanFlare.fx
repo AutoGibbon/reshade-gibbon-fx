@@ -4,15 +4,15 @@
  * A screen-space pseudo lens flare based on John Chapman's technique,
  * tuned to emulate the look of Cyberpunk 2077's built-in lens flare.
  *
- * CP2077's implementation (per Froyok's reverse-engineering):
- *   - Ghosts + halo generated in a single feature pass at half res
- *   - 4-5 ghost samples along flipped UV vector through image centre
- *   - Halo via radial warp with normalised, fixed-length vector
- *   - Per-channel (RGB) chromatic offset for colour fringing
- *   - Gaussian blur to soften features
- *   - Additive composite
+ * Pipeline:
+ *   Pass 0 - Scene luminance into 256x256 R16F with mip chain (adaptation)
+ *   Pass 1 - Feature generation: ghosts + halo + CA at half res
+ *   Pass 2 - Horizontal Gaussian blur
+ *   Pass 3 - Vertical Gaussian blur
+ *   Pass 4 - Composite with scene adaptation, saturation, tint
  *
- * Almost entirely generated code.
+ * Author: Generated for ReShade
+ * License: Public domain
  */
 
 // ============================================================================
@@ -35,6 +35,10 @@
     #define CHAPMAN_FLARE_CHROMA_SAMPLES 3
 #endif
 
+#define CHAPMAN_FLARE_LUMA_SIZE 256
+#define CHAPMAN_FLARE_LUMA_MIPS 9
+#define CHAPMAN_FLARE_LUMA_MAX_MIP 8
+
 // ============================================================================
 // INCLUDES
 // ============================================================================
@@ -49,29 +53,29 @@ uniform float fThreshold <
     ui_type = "slider";
     ui_label = "Brightness Threshold";
     ui_tooltip = "Minimum brightness for a pixel to contribute to the flare.\n"
-                 "Lower = more pixels contribute, higher = only bright highlights.\n"
-                 "CP2077 uses a very low threshold with curve falloff.";
+                 "Lower = more pixels contribute, higher = only bright highlights.";
     ui_category = "Threshold";
     ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
-> = 0.85;
+> = 0.92;
 
 uniform float fThresholdKnee <
     ui_type = "slider";
     ui_label = "Threshold Knee";
     ui_tooltip = "Softness of the threshold transition.\n"
+                 "Scales proportionally with threshold — the soft zone\n"
+                 "width is always knee * threshold.\n"
                  "0 = hard cutoff, 1 = very gradual fade-in.";
     ui_category = "Threshold";
     ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
-> = 0.5;
+> = 0.2;
 
 uniform float fGhostSpacing <
     ui_type = "slider";
     ui_label = "Ghost Spacing";
-    ui_tooltip = "Distance between ghost samples along the flare axis.\n"
-                 "Controls how spread out the repeated ghost blobs are.";
+    ui_tooltip = "Distance between ghost samples along the flare axis.";
     ui_category = "Ghosts";
     ui_min = 0.05; ui_max = 1.5; ui_step = 0.01;
-> = 0.30;
+> = 0.27;
 
 uniform float fGhostIntensity <
     ui_type = "slider";
@@ -79,16 +83,29 @@ uniform float fGhostIntensity <
     ui_tooltip = "Brightness multiplier for the ghost features.";
     ui_category = "Ghosts";
     ui_min = 0.0; ui_max = 3.0; ui_step = 0.01;
-> = 1.40;
+> = 1.0;
 
 uniform float fGhostFalloff <
     ui_type = "slider";
     ui_label = "Ghost Edge Falloff";
-    ui_tooltip = "How quickly ghosts fade near screen edges.\n"
-                 "Higher = ghosts only survive near the centre.";
+    ui_tooltip = "How far ghosts extend toward screen edges.\n"
+                 "Higher = ghosts persist further from centre.\n"
+                 "Lower = ghosts fade out quickly, concentrated near centre.";
     ui_category = "Ghosts";
     ui_min = 0.1; ui_max = 2.0; ui_step = 0.01;
-> = 0.75;
+> = 2.00;
+
+uniform float fGhostAspect <
+    ui_type = "slider";
+    ui_label = "Ghost Aspect Ratio";
+    ui_tooltip = "Horizontal stretch applied to ghost shapes.\n"
+                 "1.0 = no distortion (screen-native elliptical).\n"
+                 ">1.0 = wider ghosts (anamorphic stretch).\n"
+                 "<1.0 = taller ghosts.\n"
+                 "~1.78 on a 16:9 display = circular.";
+    ui_category = "Ghosts";
+    ui_min = 0.25; ui_max = 3.0; ui_step = 0.01;
+> = 1.17;
 
 uniform float fHaloRadius <
     ui_type = "slider";
@@ -97,7 +114,7 @@ uniform float fHaloRadius <
                  "Controls where the bright ring sits relative to image centre.";
     ui_category = "Halo";
     ui_min = 0.1; ui_max = 1.0; ui_step = 0.01;
-> = 0.53;
+> = 0.54;
 
 uniform float fHaloThickness <
     ui_type = "slider";
@@ -117,30 +134,33 @@ uniform float fHaloIntensity <
 
 uniform float fHaloAspect <
     ui_type = "slider";
-    ui_label = "Halo Aspect Correction";
-    ui_tooltip = "Corrects the halo shape for screen aspect ratio.\n"
-                 "0 = elliptical (matches screen), 1 = perfectly circular.";
+    ui_label = "Halo Aspect Ratio";
+    ui_tooltip = "Horizontal stretch applied to the halo ring.\n"
+                 "1.0 = no distortion (screen-native elliptical).\n"
+                 ">1.0 = wider halo (anamorphic stretch).\n"
+                 "<1.0 = taller halo.\n"
+                 "~1.78 on a 16:9 display = circular.\n"
+                 "Matches Ghost Aspect Ratio behaviour.";
     ui_category = "Halo";
-    ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
-> = 0.0;
+    ui_min = 0.25; ui_max = 3.0; ui_step = 0.01;
+> = 1.0;
 
 uniform float fChromaShift <
     ui_type = "slider";
     ui_label = "Chromatic Aberration";
     ui_tooltip = "Base UV-space offset for RGB channel separation.\n"
                  "CP2077 uses very wide separation — the colour fringing\n"
-                 "is often wider than the ghost blob itself.\n"
-                 "This works in UV-space (0-1), not texel-space.";
+                 "is often wider than the ghost blob itself.";
     ui_category = "Chromatic Aberration";
     ui_min = 0.0; ui_max = 0.15; ui_step = 0.001;
-> = 0.04;
+> = 0.015;
 
 uniform float fChromaRadialScale <
     ui_type = "slider";
     ui_label = "Radial Scaling";
     ui_tooltip = "How much the chromatic shift increases with distance from centre.\n"
-                 "0 = uniform shift everywhere, 1 = shift scales linearly with radius.\n"
-                 "CP2077's fringing grows significantly toward screen edges.";
+                 "0 = uniform shift everywhere.\n"
+                 "Higher = stronger fringing toward screen edges.";
     ui_category = "Chromatic Aberration";
     ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
 > = 1.0;
@@ -149,9 +169,9 @@ uniform float fBlurSigma <
     ui_type = "slider";
     ui_label = "Blur Sigma";
     ui_tooltip = "Gaussian blur sigma for softening flare features.\n"
-                 "Higher = softer, more diffuse flare. Lower = sharper ghosts.";
+                 "Higher = softer, more diffuse flare.";
     ui_category = "Blur";
-    ui_min = 0.5; ui_max = 12.0; ui_step = 0.1;
+    ui_min = 0.5; ui_max = 15.0; ui_step = 0.1;
 > = 8.0;
 
 uniform float fFlareIntensity <
@@ -166,7 +186,7 @@ uniform float fFlareSaturation <
     ui_type = "slider";
     ui_label = "Flare Saturation";
     ui_tooltip = "Colour saturation of the flare.\n"
-                 "0 = monochrome flare, 1 = full colour, >1 = boosted colour.";
+                 "0 = monochrome, 1 = natural, >1 = boosted.";
     ui_category = "Composite";
     ui_min = 0.0; ui_max = 5.0; ui_step = 0.01;
 > = 5.0;
@@ -179,6 +199,26 @@ uniform float3 fFlareTint <
     ui_category = "Composite";
 > = float3(1.0, 1.0, 1.0);
 
+uniform float fAdaptStrength <
+    ui_type = "slider";
+    ui_label = "Adaptation Strength";
+    ui_tooltip = "How much the brightness threshold rises in bright scenes.\n"
+                 "Controls what fraction of the headroom between your base\n"
+                 "threshold and 1.0 the adaptation is allowed to use.\n"
+                 "0 = threshold never moves, 1 = full range.";
+    ui_category = "Scene Adaptation";
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
+> = 0.5;
+
+uniform float fAdaptMidpoint <
+    ui_type = "slider";
+    ui_label = "Adaptation Midpoint";
+    ui_tooltip = "Scene luminance level at which flare is at half reduction.\n"
+                 "Lower = kicks in sooner, higher = only very bright scenes.";
+    ui_category = "Scene Adaptation";
+    ui_min = 0.05; ui_max = 0.8; ui_step = 0.01;
+> = 0.20;
+
 uniform bool bShowFlareOnly <
     ui_label = "Show Flare Only (Debug)";
     ui_tooltip = "Displays only the flare on a black background for tuning.";
@@ -188,6 +228,14 @@ uniform bool bShowFlareOnly <
 // ============================================================================
 // TEXTURES & SAMPLERS
 // ============================================================================
+
+texture texSceneLuma
+{
+    Width     = CHAPMAN_FLARE_LUMA_SIZE;
+    Height    = CHAPMAN_FLARE_LUMA_SIZE;
+    Format    = R16F;
+    MipLevels = CHAPMAN_FLARE_LUMA_MIPS;
+};
 
 texture texFlareFeatures
 {
@@ -211,6 +259,7 @@ texture texFlareBlurV
 };
 
 sampler sBackBuffer    { Texture = ReShade::BackBufferTex; SRGBTexture = false; };
+sampler sSceneLuma     { Texture = texSceneLuma; };
 sampler sFlareFeatures { Texture = texFlareFeatures; };
 sampler sFlareBlurH    { Texture = texFlareBlurH; };
 sampler sFlareBlurV    { Texture = texFlareBlurV; };
@@ -247,14 +296,13 @@ float3 ApplyThreshold(float3 rgb, float threshold, float knee)
 
 float3 SampleChromatic(sampler s, float2 uv, float2 direction, float distFromCentre)
 {
-    float baseShift = fChromaShift;
     float radialMul = lerp(1.0, distFromCentre * 2.0, fChromaRadialScale);
-    float totalShift = baseShift * radialMul;
+    float totalShift = fChromaShift * radialMul;
 
     float2 shiftVec = direction * totalShift;
 
-    float3 result = float3(0.0, 0.0, 0.0);
-    float3 totalWeight = float3(0.0, 0.0, 0.0);
+    float3 result = 0.0;
+    float3 totalWeight = 0.0;
 
     for (int i = 0; i < CHAPMAN_FLARE_CHROMA_SAMPLES; i++)
     {
@@ -264,7 +312,7 @@ float3 SampleChromatic(sampler s, float2 uv, float2 direction, float distFromCen
         float3 tap = tex2Dlod(s, float4(uv + offset, 0, 0)).rgb;
 
         float3 w;
-        w.r = saturate(1.0 - abs(t - (-0.667)) * 2.0);
+        w.r = saturate(1.0 - abs(t + 0.667) * 2.0);
         w.g = saturate(1.0 - abs(t) * 2.0);
         w.b = saturate(1.0 - abs(t - 0.667) * 2.0);
 
@@ -274,7 +322,14 @@ float3 SampleChromatic(sampler s, float2 uv, float2 direction, float distFromCen
         totalWeight += w;
     }
 
-    return result / max(totalWeight, float3(1e-6, 1e-6, 1e-6));
+    return result / max(totalWeight, 1e-6);
+}
+
+float2 ApplyAspectDistortion(float2 uv, float aspect)
+{
+    float2 fromCentre = uv - 0.5;
+    fromCentre.x /= max(aspect, 1e-3);
+    return fromCentre + 0.5;
 }
 
 float WindowCubic(float x, float centre, float width)
@@ -287,6 +342,19 @@ float WindowCubic(float x, float centre, float width)
 float GaussianWeight(int offset, float sigma)
 {
     return exp(-0.5 * float(offset * offset) / (sigma * sigma));
+}
+
+float GetAdaptedThreshold()
+{
+    float avgLuma = tex2Dlod(sSceneLuma, float4(0.5, 0.5, 0, CHAPMAN_FLARE_LUMA_MAX_MIP)).r;
+    float lower = fAdaptMidpoint * 0.5;
+    float upper = fAdaptMidpoint * 1.5;
+    float adaptAmount = smoothstep(lower, upper, avgLuma);
+
+    // Push threshold up into the headroom between base threshold and 1.0.
+    // Strength controls what fraction of that headroom adaptation can use.
+    float headroom = 1.0 - fThreshold;
+    return fThreshold + headroom * fAdaptStrength * adaptAmount;
 }
 
 // ============================================================================
@@ -304,28 +372,41 @@ void VS_PostProcess(
 }
 
 // ============================================================================
-// PASS 1: Feature Generation (Ghosts + Halo + Chromatic Aberration)
+// PASS 0: Scene Luminance
+// ============================================================================
+
+float PS_SceneLuminance(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
+{
+    return Luminance(tex2D(sBackBuffer, uv).rgb);
+}
+
+// ============================================================================
+// PASS 1: Feature Generation (Ghosts + Halo + CA)
 // ============================================================================
 
 float4 PS_FeatureGeneration(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
-    float aspectRatio = float(BUFFER_WIDTH) / float(BUFFER_HEIGHT);
+    float adaptedThreshold = GetAdaptedThreshold();
+    float2 flippedUV = 1.0 - uv;
 
-    float2 flippedUV = float2(1.0, 1.0) - uv;
-
-    float2 ghostVec = (float2(0.5, 0.5) - flippedUV) * fGhostSpacing;
+    float2 ghostVec = (0.5 - flippedUV) * fGhostSpacing;
     float2 direction = normalize(ghostVec);
 
-    float3 result = float3(0.0, 0.0, 0.0);
+    float3 result = 0.0;
 
     // --- GHOSTS ---
     for (int i = 0; i < CHAPMAN_FLARE_GHOST_COUNT; i++)
     {
         float2 sampleUV = frac(flippedUV + ghostVec * float(i));
 
-        float d = distance(sampleUV, float2(0.5, 0.5));
+        // Aspect distortion
+        float2 distortedUV = ApplyAspectDistortion(sampleUV, fGhostAspect);
+
+        // Weight in distorted space
+        float d = distance(distortedUV, 0.5);
         float weight = 1.0 - smoothstep(0.0, fGhostFalloff, d);
 
+        // Per-ghost spectral tint
         float ghostHue = float(i) / float(CHAPMAN_FLARE_GHOST_COUNT);
         float3 ghostTint = float3(
             1.0 + 0.15 * sin(ghostHue * 6.283),
@@ -333,8 +414,9 @@ float4 PS_FeatureGeneration(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV
             1.0 + 0.15 * sin(ghostHue * 3.0 + 1.5)
         );
 
-        float3 s = SampleChromatic(sBackBuffer, sampleUV, direction, d);
-        s = ApplyThreshold(s, fThreshold, fThresholdKnee);
+        // Chromatic sampling at distorted UV
+        float3 s = SampleChromatic(sBackBuffer, distortedUV, direction, d);
+        s = ApplyThreshold(s, adaptedThreshold, fThresholdKnee);
 
         result += s * weight * ghostTint;
     }
@@ -342,23 +424,21 @@ float4 PS_FeatureGeneration(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV
     result *= fGhostIntensity / float(CHAPMAN_FLARE_GHOST_COUNT);
 
     // --- HALO ---
-    float effectiveAspect = lerp(1.0, aspectRatio, fHaloAspect);
+    float2 haloFromCentre = 0.5 - flippedUV;
+    haloFromCentre.x *= fHaloAspect;
+    float2 haloDir = normalize(haloFromCentre);
+    float2 haloVec = haloDir * fHaloRadius;
 
-    float2 haloVec = float2(0.5, 0.5) - flippedUV;
-    haloVec.x /= effectiveAspect;
-    haloVec = normalize(haloVec);
-    haloVec.x *= effectiveAspect;
-
-    float2 correctedUV = (flippedUV - float2(0.5, 0.0)) / float2(effectiveAspect, 1.0) + float2(0.5, 0.0);
-    float haloDist = distance(correctedUV, float2(0.5, 0.5));
+    float2 distortedFlipped = ApplyAspectDistortion(flippedUV, fHaloAspect);
+    float haloDist = distance(distortedFlipped, 0.5);
     float haloWeight = WindowCubic(haloDist, fHaloRadius, fHaloThickness);
 
-    float2 haloSampleUV = flippedUV + haloVec * fHaloRadius;
+    float2 haloSampleUV = flippedUV + haloVec;
     haloSampleUV = clamp(haloSampleUV, 0.0, 1.0);
 
-    float haloDistFromCentre = distance(haloSampleUV, float2(0.5, 0.5));
-    float3 haloSample = SampleChromatic(sBackBuffer, haloSampleUV, haloVec, haloDistFromCentre);
-    haloSample = ApplyThreshold(haloSample, fThreshold, fThresholdKnee);
+    float haloDistFromCentre = distance(haloSampleUV, 0.5);
+    float3 haloSample = SampleChromatic(sBackBuffer, haloSampleUV, haloDir, haloDistFromCentre);
+    haloSample = ApplyThreshold(haloSample, adaptedThreshold, fThresholdKnee);
 
     result += haloSample * haloWeight * fHaloIntensity;
 
@@ -372,7 +452,7 @@ float4 PS_FeatureGeneration(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV
 float4 PS_BlurH(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
     float2 texelSize = float2(CHAPMAN_FLARE_DOWNSCALE, 0.0) / float2(BUFFER_WIDTH, BUFFER_HEIGHT);
-    float3 result = float3(0.0, 0.0, 0.0);
+    float3 result = 0.0;
     float  totalWeight = 0.0;
 
     int halfSamples = CHAPMAN_FLARE_BLUR_SAMPLES / 2;
@@ -395,7 +475,7 @@ float4 PS_BlurH(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 float4 PS_BlurV(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
     float2 texelSize = float2(0.0, CHAPMAN_FLARE_DOWNSCALE) / float2(BUFFER_WIDTH, BUFFER_HEIGHT);
-    float3 result = float3(0.0, 0.0, 0.0);
+    float3 result = 0.0;
     float  totalWeight = 0.0;
 
     int halfSamples = CHAPMAN_FLARE_BLUR_SAMPLES / 2;
@@ -422,12 +502,10 @@ float4 PS_Composite(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 
     // Saturation
     float flareLum = Luminance(flare);
-    flare = lerp(float3(flareLum, flareLum, flareLum), flare, fFlareSaturation);
+    flare = lerp(flareLum, flare, fFlareSaturation);
 
-    // Tint
+    // Tint and intensity
     flare *= fFlareTint;
-
-    // Intensity
     flare *= fFlareIntensity;
 
     if (bShowFlareOnly)
@@ -445,31 +523,37 @@ technique ChapmanFlare <
     ui_tooltip = "Screen-space pseudo lens flare based on John Chapman's technique,\n"
                  "tuned to emulate Cyberpunk 2077's built-in lens flare.\n\n"
                  "Features: ghosts, halo, chromatic aberration,\n"
-                 "Gaussian blur, per-ghost spectral tinting.\n\n"
+                 "anamorphic aspect controls, scene-adaptive threshold.\n\n"
                  "Place BEFORE tonemapping shaders if possible for best results.";
 >
 {
+    pass SceneLuminance
+    {
+        VertexShader = VS_PostProcess;
+        PixelShader  = PS_SceneLuminance;
+        RenderTarget = texSceneLuma;
+    }
     pass FeatureGeneration
     {
-        VertexShader  = VS_PostProcess;
-        PixelShader   = PS_FeatureGeneration;
-        RenderTarget  = texFlareFeatures;
+        VertexShader = VS_PostProcess;
+        PixelShader  = PS_FeatureGeneration;
+        RenderTarget = texFlareFeatures;
     }
     pass BlurHorizontal
     {
-        VertexShader  = VS_PostProcess;
-        PixelShader   = PS_BlurH;
-        RenderTarget  = texFlareBlurH;
+        VertexShader = VS_PostProcess;
+        PixelShader  = PS_BlurH;
+        RenderTarget = texFlareBlurH;
     }
     pass BlurVertical
     {
-        VertexShader  = VS_PostProcess;
-        PixelShader   = PS_BlurV;
-        RenderTarget  = texFlareBlurV;
+        VertexShader = VS_PostProcess;
+        PixelShader  = PS_BlurV;
+        RenderTarget = texFlareBlurV;
     }
     pass Composite
     {
-        VertexShader  = VS_PostProcess;
-        PixelShader   = PS_Composite;
+        VertexShader = VS_PostProcess;
+        PixelShader  = PS_Composite;
     }
 }
