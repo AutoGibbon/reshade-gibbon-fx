@@ -11,8 +11,8 @@
  *   Pass 3 - Vertical Gaussian blur
  *   Pass 4 - Composite with scene adaptation, saturation, tint
  *
- * Author: Generated for ReShade
- * License: Public domain
+ * Author: Gibbon
+ * License: GNU Public
  */
 
 // ============================================================================
